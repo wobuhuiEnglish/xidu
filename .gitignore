@@ -1,0 +1,8 @@
+.DS_Store
+build/
+release/
+*.dmg
+
+# 早期 Swift 原型；当前版本由 Sources/main.m 构建。
+Sources/main.swift
+
