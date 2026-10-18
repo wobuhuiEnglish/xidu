@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
 #import <ServiceManagement/ServiceManagement.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 static NSString * const KBook = @"currentBook";
 static NSString * const KRecent = @"recentBooks";
@@ -14,6 +15,8 @@ static NSString * const KNextKey = @"nextShortcut";
 static NSString * const KToggleKey = @"toggleShortcut";
 static NSString * const KLibrary = @"libraryBooks";
 static NSString * const KUnderlines = @"savedUnderlines";
+// 解析规则变化时加一，旧缓存会自动失效并重新解析。
+static NSInteger const KParserVersion = 2;
 
 @interface EPUBDelegate : NSObject <NSXMLParserDelegate>
 @property NSMutableDictionary<NSString *, NSString *> *manifest;
@@ -147,6 +150,7 @@ static NSArray<NSDictionary *> *ParseEPUB(NSURL *url, NSError **outError) {
     NSMutableArray *chapters = [NSMutableArray array];
     for (NSString *identifier in delegate.spine) {
         NSString *href = delegate.manifest[identifier]; if (!href) continue;
+        NSRange fragment = [href rangeOfString:@"#"]; if (fragment.location != NSNotFound) href = [href substringToIndex:fragment.location];
         NSURL *fileURL = [base URLByAppendingPathComponent:href.stringByRemovingPercentEncoding ?: href];
         NSData *data = [NSData dataWithContentsOfURL:fileURL]; if (!data) continue;
         NSDictionary *options = @{NSDocumentTypeDocumentAttribute: NSHTMLTextDocumentType, NSCharacterEncodingDocumentAttribute: @(NSUTF8StringEncoding)};
@@ -235,6 +239,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 @property NSPopUpButton *excerptsBookFilter;
 @property NSArray<NSDictionary *> *visibleExcerpts;
 @property BOOL didFinishLaunching;
+@property NSMutableIndexSet *failedHotKeyActions;
+@property NSString *readerLoadedBookPath;
+@property NSInteger readerLoadedChapter;
 @property NSMutableArray<NSURL *> *pendingOpenURLs;
 - (void)handleHotKey:(UInt32)identifier;
 - (NSDictionary *)importBookURL:(NSURL *)source error:(NSError **)outError;
@@ -252,10 +259,14 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(frontApplicationChanged:) name:NSWorkspaceDidActivateApplicationNotification object:nil];
     NSDictionary *diskPositions=[NSDictionary dictionaryWithContentsOfURL:[self progressFileURL]];
     self.positions = [diskPositions mutableCopy] ?: [[d dictionaryForKey:KPositions] mutableCopy] ?: [NSMutableDictionary dictionary];
+    // 书库和划线保存在 Application Support/隙读 下的 JSON 文件；首次启动新版本时
+    // 从旧版的 NSUserDefaults 迁移过来。
+    id storedLibrary=[self readStoreNamed:@"library.json"];
     self.library = [NSMutableArray array];
-    for (NSDictionary *entry in [d arrayForKey:KLibrary] ?: @[]) [self.library addObject:[entry mutableCopy]];
+    for (NSDictionary *entry in [storedLibrary isKindOfClass:NSArray.class] ? storedLibrary : ([d arrayForKey:KLibrary] ?: @[])) [self.library addObject:[entry mutableCopy]];
     self.underlines=[NSMutableDictionary dictionary];
-    NSDictionary *savedUnderlines=[d dictionaryForKey:KUnderlines]?:@{};for(NSString *path in savedUnderlines){NSMutableArray *items=[NSMutableArray array];for(NSDictionary *item in savedUnderlines[path])[items addObject:[item mutableCopy]];self.underlines[path]=items;}
+    id storedUnderlines=[self readStoreNamed:@"underlines.json"];
+    NSDictionary *savedUnderlines=[storedUnderlines isKindOfClass:NSDictionary.class]?storedUnderlines:([d dictionaryForKey:KUnderlines]?:@{});for(NSString *path in savedUnderlines){NSMutableArray *items=[NSMutableArray array];for(NSDictionary *item in savedUnderlines[path])[items addObject:[item mutableCopy]];self.underlines[path]=items;}
     // 将旧版本保存的外部文件自动复制进托管书库，并迁移阅读进度。
     NSMutableArray *legacyPaths=[NSMutableArray arrayWithArray:[d stringArrayForKey:KRecent]?:@[]];
     NSString *legacyCurrent=[d stringForKey:KBook];if(legacyCurrent.length&&![legacyPaths containsObject:legacyCurrent])[legacyPaths insertObject:legacyCurrent atIndex:0];
@@ -268,7 +279,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
         NSDictionary *entry=[self importBookURL:[NSURL fileURLWithPath:legacyPath] error:nil];
         if(entry){NSDictionary *oldPosition=self.positions[legacyPath];if(oldPosition&&!self.positions[entry[@"path"]])self.positions[entry[@"path"]]=oldPosition;if([legacyCurrent isEqual:legacyPath])[d setObject:entry[@"path"] forKey:KBook];}
     }
-    [self savePositions];[self saveLibrary];
+    [self flushPositions];[self saveLibrary];[self saveUnderlines];
     self.hotKeyRefs = [NSMutableArray array];
     EventTypeSpec type = {kEventClassKeyboard, kEventHotKeyPressed};
     InstallApplicationEventHandler(&HotKeyHandler, 1, &type, (__bridge void *)self, NULL);
@@ -290,25 +301,41 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
     [self importURLs:urls openFirst:YES];
 }
 
-- (NSURL *)libraryDirectory {
+- (NSURL *)supportDirectory {
     NSURL *support=[NSFileManager.defaultManager URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
-    NSURL *directory=[[support URLByAppendingPathComponent:@"隙读" isDirectory:YES] URLByAppendingPathComponent:@"Books" isDirectory:YES];
+    NSURL *directory=[support URLByAppendingPathComponent:@"隙读" isDirectory:YES];
     [NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];return directory;
 }
 
-- (NSURL *)progressFileURL {
-    NSURL *support=[NSFileManager.defaultManager URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
-    NSURL *directory=[support URLByAppendingPathComponent:@"隙读" isDirectory:YES];
-    [NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
-    return [directory URLByAppendingPathComponent:@"progress.plist"];
+- (NSURL *)libraryDirectory {
+    NSURL *directory=[[self supportDirectory] URLByAppendingPathComponent:@"Books" isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];return directory;
 }
 
+- (NSURL *)progressFileURL {return [[self supportDirectory] URLByAppendingPathComponent:@"progress.plist"];}
+
+// 翻页很频繁，进度合并到 1 秒后写一次盘；退出时立即写入。
 - (void)savePositions {
-    [self.positions writeToURL:[self progressFileURL] atomically:YES];
-    [NSUserDefaults.standardUserDefaults setObject:self.positions forKey:KPositions];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushPositions) object:nil];
+    [self performSelector:@selector(flushPositions) withObject:nil afterDelay:1.0];
 }
 
-- (void)saveLibrary {[NSUserDefaults.standardUserDefaults setObject:self.library forKey:KLibrary];}
+- (void)flushPositions {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(flushPositions) object:nil];
+    [self.positions writeToURL:[self progressFileURL] atomically:YES];
+}
+
+- (id)readStoreNamed:(NSString *)name {
+    NSData *data=[NSData dataWithContentsOfURL:[[self supportDirectory] URLByAppendingPathComponent:name]];
+    return data?[NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil]:nil;
+}
+
+- (void)writeStore:(id)object named:(NSString *)name {
+    NSData *data=[NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingPrettyPrinted|NSJSONWritingSortedKeys error:nil];
+    [data writeToURL:[[self supportDirectory] URLByAppendingPathComponent:name] atomically:YES];
+}
+
+- (void)saveLibrary {[self writeStore:self.library named:@"library.json"];}
 
 - (NSDictionary *)libraryEntryForPath:(NSString *)path {for(NSDictionary *entry in self.library)if([entry[@"path"]isEqual:path])return entry;return nil;}
 
@@ -390,7 +417,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
         self.statusItem.length=textWidth+48.0;button.alignment=NSTextAlignmentLeft;
         button.toolTip = self.book[@"title"] ?: @"点击选择一本书";
     }
-    [self rebuildMenu];
 }
 
 - (NSMenuItem *)item:(NSString *)title action:(SEL)action {
@@ -426,6 +452,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 }
 
 - (void)showMenu:(id)sender {
+    // 菜单（含完整章节目录）只在点开时构建，翻页时不再重建。
+    [self rebuildMenu];
     NSButton *button = self.statusItem.button;
     // 保持正文原样。inView 为 nil 时，定位点使用屏幕坐标并代表菜单
     // 左上角；横向右对齐状态项，纵向直接使用菜单栏底边。
@@ -473,7 +501,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 - (NSMenuItem *)shortcutRoot:(NSString *)title action:(NSInteger)action key:(NSString *)key {
     NSMenuItem *root=[[NSMenuItem alloc]initWithTitle:title action:nil keyEquivalent:@""];
     NSMenu *m=[NSMenu new]; NSDictionary *current=[self shortcutConfiguration:action];
-    NSMenuItem *currentItem=[[NSMenuItem alloc]initWithTitle:[@"当前：" stringByAppendingString:current[@"name"]?:@"未设置"] action:nil keyEquivalent:@""];
+    NSString *currentTitle=[@"当前：" stringByAppendingString:current[@"name"]?:@"未设置"];
+    if([self.failedHotKeyActions containsIndex:action])currentTitle=[currentTitle stringByAppendingString:@"（未生效，可能被其他程序占用）"];
+    NSMenuItem *currentItem=[[NSMenuItem alloc]initWithTitle:currentTitle action:nil keyEquivalent:@""];
     currentItem.enabled=NO; [m addItem:currentItem]; [m addItem:NSMenuItem.separatorItem];
     NSMenuItem *custom=[self item:@"自定义…" action:@selector(recordShortcut:)]; custom.tag=action; [m addItem:custom];
     NSMenuItem *presets=[[NSMenuItem alloc]initWithTitle:@"常用组合" action:nil keyEquivalent:@""]; NSMenu *presetMenu=[NSMenu new]; NSArray *opts=[self shortcutOptions:action];
@@ -526,16 +556,21 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
             if(carbon==0&&!safeSingleKey){display.stringValue=@"普通按键请同时按住修饰键";NSBeep();return nil;}
             saved=@{@"name":label,@"type":@"keyboard",@"code":@(event.keyCode),@"mods":@(carbon)};
         }
-        [NSUserDefaults.standardUserDefaults setObject:saved forKey:keys[action]];
+        captured=YES;[NSUserDefaults.standardUserDefaults setObject:saved forKey:keys[action]];
         display.stringValue=saved[@"name"];[NSApp abortModal];return nil;
     }];
     [alert runModal]; if(monitor)[NSEvent removeMonitor:monitor];if(globalMonitor)[NSEvent removeMonitor:globalMonitor]; [self registerHotKeys]; [self updateUI];
+    if(captured)[self warnIfShortcutFailed:action];
 }
 
-- (void)selectBook:(id)sender {[self addBooks:sender];}
+- (void)warnIfShortcutFailed:(NSInteger)action {
+    if(![self.failedHotKeyActions containsIndex:action])return;
+    NSAlert *alert=[NSAlert new];alert.messageText=[NSString stringWithFormat:@"快捷键 %@ 没有生效",[self shortcutConfiguration:action][@"name"]?:@""];
+    alert.informativeText=@"这个组合键可能已被系统或其他程序占用，请换一个。";[NSApp activateIgnoringOtherApps:YES];[alert runModal];
+}
 
 - (void)addBooks:(id)sender {
-    NSOpenPanel *panel=[NSOpenPanel openPanel];panel.title=@"添加电子书到隙读书架";panel.allowedFileTypes=@[@"txt",@"epub"];panel.allowsMultipleSelection=YES;panel.canChooseDirectories=NO;
+    NSOpenPanel *panel=[NSOpenPanel openPanel];panel.title=@"添加电子书到隙读书架";panel.allowedContentTypes=@[[UTType typeWithFilenameExtension:@"txt"],[UTType typeWithFilenameExtension:@"epub"]];panel.allowsMultipleSelection=YES;panel.canChooseDirectories=NO;
     if([panel runModal]!=NSModalResponseOK)return;
     [self importURLs:panel.URLs openFirst:NO];
 }
@@ -584,12 +619,12 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 - (void)removeSelectedShelfBook:(id)sender {
     NSInteger row=self.shelfTable.selectedRow;if(row<0||row>=(NSInteger)self.library.count)return;NSDictionary *entry=self.library[row];
     NSAlert *alert=[NSAlert new];alert.messageText=[NSString stringWithFormat:@"从书架移除《%@》？",entry[@"title"]];alert.informativeText=@"会删除隙读保存的书库副本、阅读进度和全部划线，但不会删除你原来导入的文件。";[alert addButtonWithTitle:@"移除"];[alert addButtonWithTitle:@"取消"];if([alert runModal]!=NSAlertFirstButtonReturn)return;
-    NSString *path=entry[@"path"];[NSFileManager.defaultManager removeItemAtPath:path error:nil];[self.library removeObjectAtIndex:row];[self.positions removeObjectForKey:path];[self.underlines removeObjectForKey:path];[self saveLibrary];[self savePositions];[self saveUnderlines];
+    NSString *path=entry[@"path"];NSURL *cacheURL=[self cacheURLForBookURL:[NSURL fileURLWithPath:path]];if(cacheURL)[NSFileManager.defaultManager removeItemAtURL:cacheURL error:nil];[NSFileManager.defaultManager removeItemAtPath:path error:nil];[self.library removeObjectAtIndex:row];[self.positions removeObjectForKey:path];[self.underlines removeObjectForKey:path];[self saveLibrary];[self savePositions];[self saveUnderlines];
     if([self.book[@"path"]isEqual:path]){[self.readerWindow close];self.book=nil;self.chapter=0;self.offset=0;[NSUserDefaults.standardUserDefaults removeObjectForKey:KBook];}
     [self.shelfTable reloadData];[self updateUI];
 }
 
-- (void)saveUnderlines {[NSUserDefaults.standardUserDefaults setObject:self.underlines forKey:KUnderlines];}
+- (void)saveUnderlines {[self writeStore:self.underlines named:@"underlines.json"];}
 
 - (void)reloadVisibleExcerpts {
     NSString *filter=self.excerptsBookFilter.selectedItem.representedObject;NSMutableArray *rows=[NSMutableArray array];
@@ -648,13 +683,29 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
     if(!self.readerWindow||!self.book)return;
     NSArray *chapters=self.book[@"chapters"];if(!chapters.count)return;
     self.updatingReader=YES;
-    [self.readerChapterPopup removeAllItems];for(NSDictionary *chapter in chapters)[self.readerChapterPopup addItemWithTitle:chapter[@"title"]];
+    // 只有换书或换章时才重建目录和正文；同一章内翻页只移动高亮，避免整章重新排版。
+    BOOL bookChanged=![self.readerLoadedBookPath isEqual:self.book[@"path"]];
+    if(bookChanged){
+        // 直接往 menu 里加项：addItemWithTitle: 会合并同名章节，导致序号错位。
+        [self.readerChapterPopup removeAllItems];
+        for(NSDictionary *chapter in chapters)[self.readerChapterPopup.menu addItemWithTitle:chapter[@"title"]?:@"" action:nil keyEquivalent:@""];
+        self.readerLoadedBookPath=self.book[@"path"];self.readerLoadedChapter=-1;
+    }
     self.readerBrowseChapter=MAX(0,MIN(self.readerBrowseChapter,(NSInteger)chapters.count-1));[self.readerChapterPopup selectItemAtIndex:self.readerBrowseChapter];
     self.readerWindow.title=[NSString stringWithFormat:@"%@ — %@",self.book[@"title"],chapters[self.readerBrowseChapter][@"title"]];
-    self.readerTextView.string=chapters[self.readerBrowseChapter][@"text"]?:@"";[self applyReaderHighlights];
+    if(self.readerLoadedChapter!=self.readerBrowseChapter){
+        self.readerTextView.string=chapters[self.readerBrowseChapter][@"text"]?:@"";self.readerLoadedChapter=self.readerBrowseChapter;
+        [self applyReaderHighlights];
+        [self.readerTextView.layoutManager ensureLayoutForTextContainer:self.readerTextView.textContainer];
+    } else [self applyTemporaryHighlights];
     NSInteger target=(self.readerBrowseChapter==self.chapter)?MAX(0,MIN(self.offset,(NSInteger)self.readerTextView.string.length)):0;
-    [self.readerTextView.layoutManager ensureLayoutForTextContainer:self.readerTextView.textContainer];
     dispatch_async(dispatch_get_main_queue(), ^{[self scrollReaderToCharacter:target];self.updatingReader=NO;});
+}
+
+// 状态栏位置变化后，让展开阅读窗口跟到当前段落；窗口没打开时不做任何排版。
+- (void)readerFollowPosition {
+    self.readerBrowseChapter=self.chapter;
+    if(self.readerWindow.isVisible)[self refreshReaderWindow];
 }
 
 - (void)scrollReaderToCharacter:(NSInteger)character {
@@ -680,15 +731,23 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 
 - (void)windowWillClose:(NSNotification *)notification {if(notification.object==self.readerWindow){[self closeReaderSearch:nil];[self updateUI];}}
 
-- (void)applicationWillTerminate:(NSNotification *)notification {[self savePositions];[NSUserDefaults.standardUserDefaults synchronize];}
+- (void)applicationWillTerminate:(NSNotification *)notification {[self flushPositions];[NSUserDefaults.standardUserDefaults synchronize];}
 
+// 字体和划线写进 textStorage（会触发重新排版，只在换章或改划线时调用）；
+// 当前段落和搜索结果用临时属性，翻页时只重绘，不重新排版。
 - (void)applyReaderHighlights {
     if(!self.readerTextView)return;NSTextStorage *storage=self.readerTextView.textStorage;NSRange all=NSMakeRange(0,storage.length);
     [storage beginEditing];[storage setAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:18],NSForegroundColorAttributeName:NSColor.labelColor} range:all];
-    if(self.readerBrowseChapter==self.chapter&&storage.length){NSInteger start=MAX(0,MIN(self.offset,(NSInteger)storage.length));NSInteger length=MIN(self.segmentLength,(NSInteger)storage.length-start);if(length>0)[storage addAttribute:NSBackgroundColorAttributeName value:[NSColor colorWithRed:0.72 green:0.91 blue:0.76 alpha:0.72] range:NSMakeRange(start,length)];}
     for(NSDictionary *underline in self.underlines[self.book[@"path"]]?:@[]){if([underline[@"chapter"]integerValue]!=self.readerBrowseChapter)continue;NSRange range=NSMakeRange([underline[@"location"]unsignedIntegerValue],[underline[@"length"]unsignedIntegerValue]);if(NSMaxRange(range)>storage.length)continue;[storage addAttribute:NSUnderlineStyleAttributeName value:@(NSUnderlineStyleSingle|NSUnderlinePatternSolid) range:range];[storage addAttribute:NSUnderlineColorAttributeName value:NSColor.systemBlueColor range:range];}
-    for(NSInteger i=0;i<(NSInteger)self.readerSearchMatches.count;i++){NSDictionary *match=self.readerSearchMatches[i];if([match[@"chapter"]integerValue]!=self.readerBrowseChapter)continue;NSRange range=NSMakeRange([match[@"location"]unsignedIntegerValue],[match[@"length"]unsignedIntegerValue]);if(NSMaxRange(range)>storage.length)continue;NSColor *color=(i==self.readerSearchIndex)?[NSColor colorWithRed:1.0 green:0.64 blue:0.20 alpha:0.82]:[NSColor colorWithRed:1.0 green:0.91 blue:0.42 alpha:0.65];[storage addAttribute:NSBackgroundColorAttributeName value:color range:range];}
     [storage endEditing];
+    [self applyTemporaryHighlights];
+}
+
+- (void)applyTemporaryHighlights {
+    if(!self.readerTextView)return;NSLayoutManager *layout=self.readerTextView.layoutManager;NSUInteger length=self.readerTextView.textStorage.length;
+    [layout removeTemporaryAttribute:NSBackgroundColorAttributeName forCharacterRange:NSMakeRange(0,length)];
+    if(self.readerBrowseChapter==self.chapter&&length){NSInteger start=MAX(0,MIN(self.offset,(NSInteger)length));NSInteger count=MIN(self.segmentLength,(NSInteger)length-start);if(count>0)[layout addTemporaryAttribute:NSBackgroundColorAttributeName value:[NSColor colorWithRed:0.72 green:0.91 blue:0.76 alpha:0.72] forCharacterRange:NSMakeRange(start,count)];}
+    for(NSInteger i=0;i<(NSInteger)self.readerSearchMatches.count;i++){NSDictionary *match=self.readerSearchMatches[i];if([match[@"chapter"]integerValue]!=self.readerBrowseChapter)continue;NSRange range=NSMakeRange([match[@"location"]unsignedIntegerValue],[match[@"length"]unsignedIntegerValue]);if(NSMaxRange(range)>length)continue;NSColor *color=(i==self.readerSearchIndex)?[NSColor colorWithRed:1.0 green:0.64 blue:0.20 alpha:0.82]:[NSColor colorWithRed:1.0 green:0.91 blue:0.42 alpha:0.65];[layout addTemporaryAttribute:NSBackgroundColorAttributeName value:color forCharacterRange:range];}
 }
 
 - (NSDictionary *)underlineAtContext {
@@ -712,18 +771,18 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 - (void)performReaderSearch {
     NSString *query=SearchNormalizedText(self.readerSearchField.stringValue?:@"",nil);NSMutableArray *all=[NSMutableArray array];NSArray *chapters=self.book[@"chapters"];
     if(query.length){if(self.readerSearchScope.indexOfSelectedItem==0){NSString *text=chapters[self.readerBrowseChapter][@"text"]?:@"";[all addObjectsFromArray:[self searchMatchesForText:text chapter:self.readerBrowseChapter query:query]];}else{for(NSInteger chapter=0;chapter<(NSInteger)chapters.count;chapter++){NSString *text=chapters[chapter][@"text"]?:@"";[all addObjectsFromArray:[self searchMatchesForText:text chapter:chapter query:query]];}}}
-    self.readerSearchMatches=all;self.readerSearchIndex=all.count?0:-1;self.readerSearchCount.stringValue=all.count?[NSString stringWithFormat:@"1 / %ld",(long)all.count]:@"0 / 0";if(all.count)[self showCurrentReaderSearchMatch];else[self applyReaderHighlights];
+    self.readerSearchMatches=all;self.readerSearchIndex=all.count?0:-1;self.readerSearchCount.stringValue=all.count?[NSString stringWithFormat:@"1 / %ld",(long)all.count]:@"0 / 0";if(all.count)[self showCurrentReaderSearchMatch];else[self applyTemporaryHighlights];
 }
 
 - (void)showCurrentReaderSearchMatch {
     if(self.readerSearchIndex<0||self.readerSearchIndex>=(NSInteger)self.readerSearchMatches.count)return;NSDictionary *match=self.readerSearchMatches[self.readerSearchIndex];NSInteger chapter=[match[@"chapter"]integerValue];BOOL chapterChanged=(chapter!=self.readerBrowseChapter);self.readerBrowseChapter=chapter;
-    if(chapterChanged)[self refreshReaderWindow];else [self applyReaderHighlights];
+    if(chapterChanged)[self refreshReaderWindow];else [self applyTemporaryHighlights];
     NSRange range=NSMakeRange([match[@"location"]unsignedIntegerValue],[match[@"length"]unsignedIntegerValue]);dispatch_async(dispatch_get_main_queue(),^{[self.readerTextView scrollRangeToVisible:range];});self.readerSearchCount.stringValue=[NSString stringWithFormat:@"%ld / %ld",(long)self.readerSearchIndex+1,(long)self.readerSearchMatches.count];
 }
 
 - (void)toggleReaderSearch:(id)sender {if(self.readerSearchBar.hidden)[self openReaderSearch:sender];else[self closeReaderSearch:sender];}
 - (void)openReaderSearch:(id)sender {self.readerSearchBar.hidden=NO;NSView *content=self.readerWindow.contentView;self.readerScrollView.frame=NSMakeRect(18,18,content.bounds.size.width-36,content.bounds.size.height-118);[self.readerWindow makeFirstResponder:self.readerSearchField];[self.readerSearchField selectText:nil];}
-- (void)closeReaderSearch:(id)sender {if(!self.readerSearchBar)return;self.readerSearchBar.hidden=YES;self.readerSearchField.stringValue=@"";self.readerSearchMatches=@[];self.readerSearchIndex=-1;self.readerSearchCount.stringValue=@"0 / 0";NSView *content=self.readerWindow.contentView;self.readerScrollView.frame=NSMakeRect(18,18,content.bounds.size.width-36,content.bounds.size.height-78);[self applyReaderHighlights];}
+- (void)closeReaderSearch:(id)sender {if(!self.readerSearchBar)return;self.readerSearchBar.hidden=YES;self.readerSearchField.stringValue=@"";self.readerSearchMatches=@[];self.readerSearchIndex=-1;self.readerSearchCount.stringValue=@"0 / 0";NSView *content=self.readerWindow.contentView;self.readerScrollView.frame=NSMakeRect(18,18,content.bounds.size.width-36,content.bounds.size.height-78);[self applyTemporaryHighlights];}
 - (void)controlTextDidChange:(NSNotification *)notification {if(notification.object==self.readerSearchField)[self performReaderSearch];}
 - (void)readerSearchScopeChanged:(id)sender {[self performReaderSearch];}
 - (void)readerSearchSubmit:(id)sender {if(NSApp.currentEvent.modifierFlags&NSEventModifierFlagShift)[self readerSearchPrevious:sender];else[self readerSearchNext:sender];}
@@ -733,33 +792,46 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 - (void)continueReadingHere:(id)sender {
     NSInteger target=self.readerTextView.contextCharacterIndex;NSInteger maximum=MAX(0,(NSInteger)self.readerTextView.string.length-1);target=MAX(0,MIN(target,maximum));self.chapter=self.readerBrowseChapter;self.offset=target;self.readerTextView.selectedRange=NSMakeRange(target,0);
     NSString *path=self.book[@"path"];self.positions[path]=@{@"chapter":@(self.chapter),@"offset":@(self.offset)};[self savePositions];
-    [self applyReaderHighlights];[self updateUI];
-}
-
-- (void)removeBookFromShelf:(NSMenuItem *)sender {
-    NSString *path=sender.representedObject;if(!path.length)return;NSString *title=[path.lastPathComponent stringByDeletingPathExtension];
-    NSAlert *alert=[NSAlert new];alert.messageText=[NSString stringWithFormat:@"从书架移除《%@》？",title];alert.informativeText=@"将同时清除这本书的阅读进度和全部划线，但不会删除原始 TXT/EPUB 文件。";[alert addButtonWithTitle:@"移除"];[alert addButtonWithTitle:@"取消"];
-    if([alert runModal]!=NSAlertFirstButtonReturn)return;
-    NSMutableArray *recent=[[[NSUserDefaults standardUserDefaults]stringArrayForKey:KRecent]mutableCopy]?:[NSMutableArray array];[recent removeObject:path];[[NSUserDefaults standardUserDefaults]setObject:recent forKey:KRecent];
-    [self.positions removeObjectForKey:path];[self.underlines removeObjectForKey:path];[self savePositions];[self saveUnderlines];
-    if([self.book[@"path"]isEqual:path]){[self.readerWindow close];self.book=nil;self.chapter=0;self.offset=0;[[NSUserDefaults standardUserDefaults]removeObjectForKey:KBook];}
-    [self updateUI];
+    [self applyTemporaryHighlights];[self updateUI];
 }
 
 - (BOOL)openURL:(NSURL *)url showError:(BOOL)showError {
     NSError *error=nil;NSArray *chapters=nil;
-    if([url.pathExtension.lowercaseString isEqual:@"epub"])chapters=ParseEPUB(url,&error);else{NSString *text=DecodeTextFile(url,&error);if(text)chapters=ParseTXT(text);}
+    chapters=[self chaptersForURL:url error:&error];
     if(!chapters.count){if(showError){NSAlert *a=[NSAlert new];a.messageText=@"无法打开这本书";a.informativeText=error.localizedDescription?:@"没有找到可读取的正文";[a runModal];}return NO;}
     [self savePosition];NSDictionary *libraryEntry=[self libraryEntryForPath:url.path];NSString *displayTitle=libraryEntry[@"title"]?:url.URLByDeletingPathExtension.lastPathComponent;self.book=@{@"path":url.path,@"title":displayTitle,@"chapters":chapters};NSDictionary *pos=self.positions[url.path];self.chapter=[pos[@"chapter"]integerValue];self.offset=[pos[@"offset"]integerValue];
-    NSUserDefaults *d=NSUserDefaults.standardUserDefaults;[d setObject:url.path forKey:KBook];NSMutableArray *recent=[[d stringArrayForKey:KRecent]mutableCopy]?:[NSMutableArray array];[recent removeObject:url.path];[recent insertObject:url.path atIndex:0];if(recent.count>10)[recent removeObjectsInRange:NSMakeRange(10,recent.count-10)];[d setObject:recent forKey:KRecent];self.readerBrowseChapter=self.chapter;[self refreshReaderWindow];[self updateUI];return YES;
+    [NSUserDefaults.standardUserDefaults setObject:url.path forKey:KBook];[self readerFollowPosition];[self updateUI];return YES;
 }
+// 解析结果缓存在 Application Support/隙读/Cache，按解析版本、文件大小和修改时间校验。
+// EPUB 解析要解压并经过 HTML 排版引擎，缓存后再次打开和启动都不必重复。
+- (NSURL *)cacheURLForBookURL:(NSURL *)url {
+    if(![url.URLByDeletingLastPathComponent.path isEqual:[self libraryDirectory].path])return nil;
+    NSURL *directory=[[self supportDirectory]URLByAppendingPathComponent:@"Cache" isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
+    return [directory URLByAppendingPathComponent:[url.lastPathComponent stringByAppendingString:@".plist"]];
+}
+
+- (NSArray<NSDictionary *> *)chaptersForURL:(NSURL *)url error:(NSError **)outError {
+    NSDictionary *attrs=[NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil];
+    NSNumber *size=attrs[NSFileSize]?:@0;NSNumber *modified=@([attrs[NSFileModificationDate] timeIntervalSince1970]);
+    NSURL *cacheURL=[self cacheURLForBookURL:url];
+    NSDictionary *cached=cacheURL?[NSDictionary dictionaryWithContentsOfURL:cacheURL]:nil;
+    if([cached[@"version"] integerValue]==KParserVersion&&[cached[@"size"] isEqual:size]&&[cached[@"modified"] isEqual:modified]&&[cached[@"chapters"] count])return cached[@"chapters"];
+    NSArray *chapters=nil;
+    if([url.pathExtension.lowercaseString isEqual:@"epub"])chapters=ParseEPUB(url,outError);else{NSString *text=DecodeTextFile(url,outError);if(text)chapters=ParseTXT(text);}
+    if(chapters.count&&cacheURL){
+        NSData *data=[NSPropertyListSerialization dataWithPropertyList:@{@"version":@(KParserVersion),@"size":size,@"modified":modified,@"chapters":chapters} format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+        [data writeToURL:cacheURL atomically:YES];
+    }
+    return chapters;
+}
+
 - (void)savePosition {NSString *path=self.book[@"path"];if(!path)return;self.positions[path]=@{@"chapter":@(self.chapter),@"offset":@(self.offset)};[self savePositions];}
-- (void)openRecent:(NSMenuItem *)sender {[self openURL:[NSURL fileURLWithPath:sender.representedObject] showError:YES];}
-- (void)previous:(id)sender {NSArray *cs=self.book[@"chapters"];if(!cs.count)return;NSInteger step=self.segmentLength;if(self.offset>=step)self.offset-=step;else if(self.chapter>0){self.chapter--;self.offset=MAX(0,(NSInteger)[cs[self.chapter][@"text"]length]-step);}else self.offset=0;[self savePosition];self.readerBrowseChapter=self.chapter;[self refreshReaderWindow];[self updateUI];}
-- (void)next:(id)sender {NSArray *cs=self.book[@"chapters"];if(!cs.count)return;NSInteger step=self.segmentLength;NSString *text=cs[self.chapter][@"text"];if(self.offset+step<(NSInteger)text.length)self.offset+=step;else if(self.chapter+1<(NSInteger)cs.count){self.chapter++;self.offset=0;}else self.offset=MAX(0,(NSInteger)text.length-step);[self savePosition];self.readerBrowseChapter=self.chapter;[self refreshReaderWindow];[self updateUI];}
+- (void)previous:(id)sender {NSArray *cs=self.book[@"chapters"];if(!cs.count)return;NSInteger step=self.segmentLength;if(self.offset>=step)self.offset-=step;else if(self.chapter>0){self.chapter--;self.offset=MAX(0,(NSInteger)[cs[self.chapter][@"text"]length]-step);}else self.offset=0;[self savePosition];[self readerFollowPosition];[self updateUI];}
+- (void)next:(id)sender {NSArray *cs=self.book[@"chapters"];if(!cs.count)return;NSInteger step=self.segmentLength;NSString *text=cs[self.chapter][@"text"];if(self.offset+step<(NSInteger)text.length)self.offset+=step;else if(self.chapter+1<(NSInteger)cs.count){self.chapter++;self.offset=0;}else self.offset=MAX(0,(NSInteger)text.length-step);[self savePosition];[self readerFollowPosition];[self updateUI];}
 - (void)toggleText:(id)sender {NSUserDefaults *d=NSUserDefaults.standardUserDefaults;[d setBool:![d boolForKey:KHidden] forKey:KHidden];[self updateUI];}
-- (void)selectChapter:(NSMenuItem *)sender {self.chapter=sender.tag;self.offset=0;[self savePosition];self.readerBrowseChapter=self.chapter;[self refreshReaderWindow];[self updateUI];}
-- (void)setLength:(NSMenuItem *)s {[NSUserDefaults.standardUserDefaults setInteger:s.tag forKey:KLength];[self applyReaderHighlights];[self updateUI];}
+- (void)selectChapter:(NSMenuItem *)sender {self.chapter=sender.tag;self.offset=0;[self savePosition];[self readerFollowPosition];[self updateUI];}
+- (void)setLength:(NSMenuItem *)s {[NSUserDefaults.standardUserDefaults setInteger:s.tag forKey:KLength];[self applyTemporaryHighlights];[self updateUI];}
 - (void)setCustomLength:(id)sender {
     NSAlert *alert=[NSAlert new];alert.messageText=@"自定义显示字数";alert.informativeText=@"请输入每段显示的字数（5–200）：";
     NSTextField *input=[[NSTextField alloc]initWithFrame:NSMakeRect(0,0,220,26)];NSInteger current=[NSUserDefaults.standardUserDefaults integerForKey:KLength];input.stringValue=current>0?[NSString stringWithFormat:@"%ld",(long)current]:@"30";input.placeholderString=@"例如：35";alert.accessoryView=input;
@@ -768,11 +840,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
     if([alert runModal]!=NSAlertFirstButtonReturn)return;
     NSInteger value=input.integerValue;
     if(value<5||value>200){NSAlert *warning=[NSAlert new];warning.messageText=@"请输入 5–200 之间的字数";[warning runModal];return;}
-    [NSUserDefaults.standardUserDefaults setInteger:value forKey:KLength];[self applyReaderHighlights];[self updateUI];
+    [NSUserDefaults.standardUserDefaults setInteger:value forKey:KLength];[self applyTemporaryHighlights];[self updateUI];
 }
 - (void)setFont:(NSMenuItem *)s {[NSUserDefaults.standardUserDefaults setDouble:s.tag forKey:KFont];[self updateUI];}
 - (void)setColor:(NSMenuItem *)s {[NSUserDefaults.standardUserDefaults setObject:s.representedObject forKey:KColor];[self updateUI];}
-- (void)setShortcut:(NSMenuItem *)s {NSInteger action=s.tag/10,index=s.tag%10;NSArray *keys=@[KPrevKey,KNextKey,KToggleKey];NSMutableDictionary *option=[[self shortcutOptions:action][index]mutableCopy];option[@"type"]=@"keyboard";[NSUserDefaults.standardUserDefaults setObject:option forKey:keys[action]];[self registerHotKeys];[self updateUI];}
+- (void)setShortcut:(NSMenuItem *)s {NSInteger action=s.tag/10,index=s.tag%10;NSArray *keys=@[KPrevKey,KNextKey,KToggleKey];NSMutableDictionary *option=[[self shortcutOptions:action][index]mutableCopy];option[@"type"]=@"keyboard";[NSUserDefaults.standardUserDefaults setObject:option forKey:keys[action]];[self registerHotKeys];[self updateUI];[self warnIfShortcutFailed:action];}
 - (void)clearRegisteredShortcuts {
     for(NSValue *v in self.hotKeyRefs){EventHotKeyRef ref=(EventHotKeyRef)v.pointerValue;if(ref)UnregisterEventHotKey(ref);}[self.hotKeyRefs removeAllObjects];
     if(self.globalMouseMonitor){[NSEvent removeMonitor:self.globalMouseMonitor];self.globalMouseMonitor=nil;}
@@ -783,8 +855,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 }
 - (void)registerHotKeys {
     [self clearRegisteredShortcuts];
+    self.failedHotKeyActions=[NSMutableIndexSet indexSet];
     BOOL hasMouseShortcut=NO;
-    for(NSInteger a=0;a<3;a++){NSDictionary *opt=[self shortcutConfiguration:a];if([opt[@"type"]isEqual:@"mouse"]){hasMouseShortcut=YES;continue;}EventHotKeyRef ref=NULL;EventHotKeyID ident={'XIDU',(UInt32)a+1};RegisterEventHotKey([opt[@"code"]unsignedIntValue],[opt[@"mods"]unsignedIntValue],ident,GetApplicationEventTarget(),0,&ref);if(ref)[self.hotKeyRefs addObject:[NSValue valueWithPointer:ref]];}
+    for(NSInteger a=0;a<3;a++){NSDictionary *opt=[self shortcutConfiguration:a];if([opt[@"type"]isEqual:@"mouse"]){hasMouseShortcut=YES;continue;}EventHotKeyRef ref=NULL;EventHotKeyID ident={'XIDU',(UInt32)a+1};OSStatus status=RegisterEventHotKey([opt[@"code"]unsignedIntValue],[opt[@"mods"]unsignedIntValue],ident,GetApplicationEventTarget(),0,&ref);if(status==noErr&&ref)[self.hotKeyRefs addObject:[NSValue valueWithPointer:ref]];else[self.failedHotKeyActions addIndex:a];}
     if(hasMouseShortcut){__weak typeof(self) weakSelf=self;self.globalMouseMonitor=[NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskOtherMouseDown handler:^(NSEvent *event){[weakSelf handleMouseEvent:event];}];self.localMouseMonitor=[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskOtherMouseDown handler:^NSEvent *(NSEvent *event){[weakSelf handleMouseEvent:event];return event;}];}
 }
 - (void)handleHotKey:(UInt32)i {dispatch_async(dispatch_get_main_queue(),^{if(i==1)[self previous:nil];else if(i==2)[self next:nil];else if(i==3)[self toggleText:nil];});}
