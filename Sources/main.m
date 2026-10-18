@@ -576,8 +576,11 @@ static BOOL IsBreakCharacter(unichar c) {
     NSRect windowRect = [button convertRect:button.bounds toView:nil];
     NSRect screenRect = [button.window convertRectToScreen:windowRect];
     NSSize menuSize = self.popupMenu.size;
-    NSPoint origin = NSMakePoint(NSMaxX(screenRect) - menuSize.width,
-                                 NSMinY(screenRect) - 2);
+    // 刘海屏的菜单栏（约 38pt）比状态栏按钮（22pt）高，按钮底边仍在菜单栏里面；
+    // 菜单顶端若伸进菜单栏，系统会裁掉第一项并显示滚动箭头，所以以菜单栏底边为准。
+    NSScreen *screen = button.window.screen ?: NSScreen.mainScreen;
+    CGFloat top = MIN(NSMinY(screenRect) - 2, NSMaxY(screen.visibleFrame));
+    NSPoint origin = NSMakePoint(NSMaxX(screenRect) - menuSize.width, top);
     [self.popupMenu popUpMenuPositioningItem:nil atLocation:origin inView:nil];
 }
 
