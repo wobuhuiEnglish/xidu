@@ -511,7 +511,9 @@ static BOOL IsBreakCharacter(unichar c) {
         // 状态项右侧保留 48pt 安静空间。状态项仍锚定在右侧状态区，
         // 因此这段留白会把正文整体向左移动，但不会贴住应用菜单。
         CGFloat textWidth=ceil(button.attributedTitle.size.width);
-        self.statusItem.length=textWidth+48.0;button.alignment=NSTextAlignmentLeft;
+        // 普通屏幕在正文右侧留 48pt 安静空间；刘海屏的状态栏空间很紧，只留 8pt。
+        CGFloat padding=48.0;if(@available(macOS 12.0,*)){NSScreen *screen=button.window.screen?:NSScreen.mainScreen;if(screen.safeAreaInsets.top>0)padding=8.0;}
+        self.statusItem.length=textWidth+padding;button.alignment=NSTextAlignmentLeft;
         [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(checkStatusFit) object:nil];
         [self performSelector:@selector(checkStatusFit) withObject:nil afterDelay:0.3];
         button.toolTip = self.book[@"title"] ?: @"点击选择一本书";
@@ -522,6 +524,18 @@ static BOOL IsBreakCharacter(unichar c) {
 // 显示正文后检查一次：被挤出去就把字数缩到 60%，最短 6 个字；仍放不下就退回图标。
 - (BOOL)statusItemOffscreen {
     NSWindow *window = self.statusItem.button.window; if (!window) return NO;
+    // 空间不够时，系统有时把状态项留在原位但不再绘制，所以直接问窗口服务器它是否真的在屏幕上。
+    NSArray *info = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, (CGWindowID)window.windowNumber));
+    if (info.count && ![info.firstObject[(id)kCGWindowIsOnscreen] boolValue]) return YES;
+    // 压在刘海上的部分也看不见。
+    if (@available(macOS 12.0, *)) {
+        NSScreen *screen = window.screen;
+        if (screen.safeAreaInsets.top > 0) {
+            NSRect left = screen.auxiliaryTopLeftArea, right = screen.auxiliaryTopRightArea;
+            NSRect notch = NSMakeRect(NSMaxX(left), NSMinY(right), NSMinX(right) - NSMaxX(left), NSHeight(right));
+            if (NSIntersectsRect(window.frame, notch)) return YES;
+        }
+    }
     for (NSScreen *screen in NSScreen.screens) if (NSContainsRect(NSInsetRect(screen.frame, -1, -1), window.frame)) return NO;
     return YES;
 }
