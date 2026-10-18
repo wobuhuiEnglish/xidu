@@ -249,6 +249,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 @property BOOL didFinishLaunching;
 @property NSMutableIndexSet *failedHotKeyActions;
 @property id statusScrollMonitor;
+@property NSInteger fitLimit;
+@property BOOL fitGaveUp;
 @property CGFloat statusScrollAccumulator;
 @property NSTimer *autoTurnTimer;
 @property BOOL autoHidden;
@@ -267,6 +269,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
+    // 同时运行两份隙读（例如“应用程序”里一份、另一处一份）会争抢菜单栏空间和设置，
+    // 新启动的这份直接退出。
+    for (NSRunningApplication *other in [NSRunningApplication runningApplicationsWithBundleIdentifier:NSBundle.mainBundle.bundleIdentifier ?: @""]) {
+        if (other.processIdentifier != NSProcessInfo.processInfo.processIdentifier) { [NSApp terminate:nil]; return; }
+    }
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     [d registerDefaults:@{KHidden:@NO, KLength:@0, KFont:@13, KColor:@"label", KPrevKey:@0, KNextKey:@0, KToggleKey:@0, KShortcutsPaused:@NO, KClickToTurn:@YES, KSmartBreak:@YES, KAutoInterval:@0, KMeetingHide:@YES, KReaderFont:@18, KReaderSpacing:@1.3, KReaderTheme:@"system"}];
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
@@ -394,6 +401,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
             }
         }
     }
+    // 菜单栏放不下时临时缩短（见 checkStatusFit）。
+    if (self.fitLimit > 0) requested = MIN(requested, self.fitLimit);
     // 阅读段长只由用户设置（或自动值）决定，不随前台程序改变。
     // 这样切换 Chrome、Finder 等应用时，正文范围和翻页步长始终一致。
     return requested;
@@ -409,6 +418,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef next, EventRef event, void *da
 
 - (void)frontApplicationChanged:(NSNotification *)notification {
     [self updateMeetingHide];
+    // 换了前台程序，菜单栏可用空间也变了，重新按完整长度尝试。
+    [self resetStatusFit];
     self.statusItem.visible = YES;
     [self updateUI];
     // 等系统完成新应用菜单布局后再刷新一次，避免状态项沿用上一帧的
@@ -475,14 +486,14 @@ static BOOL IsBreakCharacter(unichar c) {
 - (void)updateUI {
     self.statusItem.visible = YES;
     NSButton *button = self.statusItem.button;
-    BOOL hidden = [NSUserDefaults.standardUserDefaults boolForKey:KHidden] || self.autoHidden;
+    BOOL hidden = [NSUserDefaults.standardUserDefaults boolForKey:KHidden] || self.autoHidden || self.fitGaveUp;
     if (!self.book && !self.library.count) {
         // 第一次使用：直接告诉用户点这里添加书籍。
         button.image = nil; button.font = [NSFont systemFontOfSize:13]; button.title = @"隙读 · 点此添加书籍";
         self.statusItem.length = NSVariableStatusItemLength; button.toolTip = @"点击添加 TXT 或 EPUB";
     } else if (hidden || !self.book) {
         self.statusItem.length=NSSquareStatusItemLength;button.alignment=NSTextAlignmentCenter;
-        button.title = @""; button.image = [NSImage imageWithSystemSymbolName:@"book.closed" accessibilityDescription:@"隙读"]; button.toolTip = self.book ? @"隙读：正文已隐藏" : @"隙读：点击选择书籍";
+        button.title = @""; button.image = [NSImage imageWithSystemSymbolName:@"book.closed" accessibilityDescription:@"隙读"]; button.toolTip = self.fitGaveUp ? @"隙读：菜单栏空间不足，正文暂时收起" : (self.book ? @"隙读：正文已隐藏" : @"隙读：点击选择书籍");
     } else {
         button.image = nil;
         NSFont *font = [NSFont systemFontOfSize:[NSUserDefaults.standardUserDefaults doubleForKey:KFont]];
@@ -501,9 +512,28 @@ static BOOL IsBreakCharacter(unichar c) {
         // 因此这段留白会把正文整体向左移动，但不会贴住应用菜单。
         CGFloat textWidth=ceil(button.attributedTitle.size.width);
         self.statusItem.length=textWidth+48.0;button.alignment=NSTextAlignmentLeft;
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(checkStatusFit) object:nil];
+        [self performSelector:@selector(checkStatusFit) withObject:nil afterDelay:0.3];
         button.toolTip = self.book[@"title"] ?: @"点击选择一本书";
     }
 }
+
+// 菜单栏放不下时，macOS 会把状态项移出屏幕（看起来像程序消失了）。
+// 显示正文后检查一次：被挤出去就把字数缩到 60%，最短 6 个字；仍放不下就退回图标。
+- (BOOL)statusItemOffscreen {
+    NSWindow *window = self.statusItem.button.window; if (!window) return NO;
+    for (NSScreen *screen in NSScreen.screens) if (NSContainsRect(NSInsetRect(screen.frame, -1, -1), window.frame)) return NO;
+    return YES;
+}
+- (void)checkStatusFit {
+    if (!self.book || self.fitGaveUp || self.autoHidden || [NSUserDefaults.standardUserDefaults boolForKey:KHidden]) return;
+    if (![self statusItemOffscreen]) return;
+    NSInteger shown = self.currentText.length;
+    if (shown <= 6) self.fitGaveUp = YES;
+    else self.fitLimit = MAX(6, (NSInteger)(shown * 0.6));
+    [self applyTemporaryHighlights]; [self updateUI];
+}
+- (void)resetStatusFit {self.fitLimit = 0; self.fitGaveUp = NO;}
 
 - (NSMenuItem *)item:(NSString *)title action:(SEL)action {
     NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""]; item.target = self; return item;
@@ -1062,20 +1092,20 @@ static BOOL IsBreakCharacter(unichar c) {
     [self savePosition];[self readerFollowPosition];[self updateUI];
     if(self.autoTurnTimer)self.autoTurnTimer.fireDate=[NSDate dateWithTimeIntervalSinceNow:self.autoTurnTimer.timeInterval];  // 手动翻页后重新计时
 }
-- (void)toggleText:(id)sender {NSUserDefaults *d=NSUserDefaults.standardUserDefaults;[d setBool:![d boolForKey:KHidden] forKey:KHidden];[self updateUI];}
+- (void)toggleText:(id)sender {[self resetStatusFit];NSUserDefaults *d=NSUserDefaults.standardUserDefaults;[d setBool:![d boolForKey:KHidden] forKey:KHidden];[self updateUI];}
 - (void)selectChapter:(NSMenuItem *)sender {self.chapter=sender.tag;self.offset=0;[self savePosition];[self readerFollowPosition];[self updateUI];}
-- (void)setLength:(NSMenuItem *)s {[NSUserDefaults.standardUserDefaults setInteger:s.tag forKey:KLength];[self applyTemporaryHighlights];[self updateUI];}
+- (void)setLength:(NSMenuItem *)s {[self resetStatusFit];[NSUserDefaults.standardUserDefaults setInteger:s.tag forKey:KLength];[self applyTemporaryHighlights];[self updateUI];}
 - (void)setCustomLength:(id)sender {
     NSAlert *alert=[NSAlert new];alert.messageText=@"自定义显示字数";alert.informativeText=@"请输入每段显示的字数（5–200）：";
     NSTextField *input=[[NSTextField alloc]initWithFrame:NSMakeRect(0,0,220,26)];NSInteger current=[NSUserDefaults.standardUserDefaults integerForKey:KLength];input.stringValue=current>0?[NSString stringWithFormat:@"%ld",(long)current]:@"30";input.placeholderString=@"例如：35";alert.accessoryView=input;
     [alert addButtonWithTitle:@"确定"];[alert addButtonWithTitle:@"取消"];
     [alert.window setInitialFirstResponder:input];
     if([alert runModal]!=NSAlertFirstButtonReturn)return;
-    NSInteger value=input.integerValue;
+    NSInteger value=input.integerValue;[self resetStatusFit];
     if(value<5||value>200){NSAlert *warning=[NSAlert new];warning.messageText=@"请输入 5–200 之间的字数";[warning runModal];return;}
     [NSUserDefaults.standardUserDefaults setInteger:value forKey:KLength];[self applyTemporaryHighlights];[self updateUI];
 }
-- (void)setFont:(NSMenuItem *)s {[NSUserDefaults.standardUserDefaults setDouble:s.tag forKey:KFont];[self updateUI];}
+- (void)setFont:(NSMenuItem *)s {[self resetStatusFit];[NSUserDefaults.standardUserDefaults setDouble:s.tag forKey:KFont];[self updateUI];}
 - (void)setColor:(NSMenuItem *)s {[NSUserDefaults.standardUserDefaults setObject:s.representedObject forKey:KColor];[self updateUI];}
 - (void)setShortcut:(NSMenuItem *)s {NSInteger action=s.tag/10,index=s.tag%10;NSArray *keys=@[KPrevKey,KNextKey,KToggleKey];NSMutableDictionary *option=[[self shortcutOptions:action][index]mutableCopy];option[@"type"]=@"keyboard";[NSUserDefaults.standardUserDefaults setObject:option forKey:keys[action]];[self registerHotKeys];[self updateUI];[self warnIfShortcutFailed:action];}
 - (void)clearRegisteredShortcuts {
